@@ -1,5 +1,3 @@
-Here’s a complete, polished **README.md** you can drop into your repo. It keeps the product story crisp, adds a clear Quick Start, environment/config docs, ops commands, smoke test, troubleshooting, and links to your Chinese docs.
-
 ---
 
 # Contextual
