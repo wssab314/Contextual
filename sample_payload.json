@@ -1,0 +1,12 @@
+{
+    "repository": { "full_name": "aibu/contextual-demo" },
+    "commits": [{
+      "id": "abcdef1234567890abcdef1234567890abcdef12",
+      "message": "feat: add fraud check",
+      "author": {"email": "dev@example.com"},
+      "added": ["a.txt"],
+      "modified": ["b.py"],
+      "removed": []
+    }]
+  }
+  
