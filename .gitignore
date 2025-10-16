@@ -1,0 +1,15 @@
+# secrets & local config
+.env
+
+
+# python
+__pycache__/
+*.pyc
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# docker volumes (if any)
+pgdata/

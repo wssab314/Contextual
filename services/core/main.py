@@ -1,0 +1,101 @@
+import os, json, time, base64, hmac, hashlib, urllib.parse
+import pika, requests
+import psycopg
+from fastapi import FastAPI
+
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST","rabbitmq")
+RABBITMQ_USER = os.getenv("RABBITMQ_USER","guest")
+RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD","guest")
+QUEUE_RAW = "git_commit_raw"
+
+POSTGRES_DSN = f"host={os.getenv('POSTGRES_HOST','postgres')} dbname={os.getenv('POSTGRES_DB','contextual')} user={os.getenv('POSTGRES_USER','postgres')} password={os.getenv('POSTGRES_PASSWORD','postgres')}"
+DING_URL = os.getenv("DINGTALK_WEBHOOK_URL","")
+DING_SECRET = os.getenv("DINGTALK_SECRET","")
+PUBLIC_BASE = os.getenv("PUBLIC_BASE_URL","http://localhost:8003")
+
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+def ding_sign_url(base_url:str, secret:str):
+    ts = str(int(time.time() * 1000))
+    string_to_sign = f"{ts}\n{secret}".encode("utf-8")
+    h = hmac.new(secret.encode("utf-8"), string_to_sign, digestmod=hashlib.sha256).digest()
+    sign = urllib.parse.quote_plus(base64.b64encode(h))
+    return f"{base_url}&timestamp={ts}&sign={sign}"
+
+def send_action_card(trace_id:str, commit_hash:str, repo:str, top1_key:str):
+    import requests, os, json, time, hmac, hashlib, base64, urllib.parse
+    url = ding_sign_url(DING_URL, DING_SECRET) if DING_SECRET and "sign=" not in DING_URL else DING_URL
+    keyword = os.getenv("DINGTALK_KEYWORD","").strip()
+    body_text = f"**Contextual 推荐关联**\n\n仓库：{repo}\nCommit：`{commit_hash}`\n\n猜测的 Jira：**{top1_key}**\n"
+    if keyword:
+        body_text = f"{keyword}\n\n" + body_text
+    yes_url = f"{PUBLIC_BASE}/callback/dingtalk?trace_id={trace_id}&commit={commit_hash}&jira={top1_key}&feedback=true"
+    no_url  = f"{PUBLIC_BASE}/callback/dingtalk?trace_id={trace_id}&commit={commit_hash}&jira={top1_key}&feedback=false"
+    payload = {
+        "msgtype": "actionCard",
+        "actionCard": {
+            "title": "是否关联到该 Jira 任务？",
+            "text": body_text,
+            "btns": [
+                {"title":"✅ Yes, link it", "actionURL": yes_url},
+                {"title":"❌ No, choose another", "actionURL": no_url}
+            ],
+            "btnOrientation":"0"
+        }
+    }
+    r = requests.post(url, json=payload, timeout=(5, 10))
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    print("[DINGTALK RESP]", r.status_code, data)
+    r.raise_for_status()
+    if isinstance(data, dict) and data.get("errcode",0)!=0:
+        raise RuntimeError(f"DingTalk send failed: {data}")
+    return data
+
+
+def consume():
+    creds = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASSWORD)
+    conn = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=creds))
+    ch = conn.channel()
+    ch.queue_declare(queue=QUEUE_RAW, durable=True)
+
+    def _cb(chx, method, props, body):
+        msg = json.loads(body)
+        p = msg.get("payload",{})
+        repo = p.get("repo","")
+        commit_hash = p.get("commit_hash","")
+        trace_id = msg.get("trace_id","")
+        # 伪推荐：固定 key
+        top1 = "DEMO-1"
+        try:
+            res = send_action_card(trace_id, commit_hash, repo, top1)
+            # 简单写 notifications 记录
+            with psycopg.connect(POSTGRES_DSN) as db:
+                db.execute(
+                  "INSERT INTO notifications(trace_id,tenant_id,commit_hash,recommended_jira_key,confidence,delivered_at) VALUES(%s,%s,%s,%s,%s,NOW())",
+                  (trace_id,"tenant-demo", commit_hash, top1, 0.8)
+                )
+            chx.basic_ack(delivery_tag=method.delivery_tag)
+        except Exception as e:
+            print("send ding error:", e)
+            chx.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+    ch.basic_qos(prefetch_count=10)
+    ch.basic_consume(queue=QUEUE_RAW, on_message_callback=_cb)
+    print(" [*] Core consuming. Ctrl+C to exit.")
+    try:
+        ch.start_consuming()
+    except KeyboardInterrupt:
+        ch.stop_consuming()
+    conn.close()
+
+# 启动消费线程
+import threading
+t = threading.Thread(target=consume, daemon=True)
+t.start()
