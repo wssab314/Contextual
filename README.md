@@ -1,274 +1,174 @@
----
-
 # Contextual
 
-<div align="right">
-  <a href="docs/README.zh-CN.md">🇨🇳 中文文档</a>
-</div>
+> **AI-powered context linker for your commits ↔ Jira.**  
+> Runs beside your team (DingTalk first; Slack/Teams next), reads commit intent, recommends the most relevant Jira issue, and lets engineers confirm with one click.
 
-> **AI-powered dev context manager.**
-> Lives in DingTalk / Slack / Microsoft Teams. Links commits ⇄ Jira with one click.
+[中文文档 »](docs/README.zh-CN.md)
 
 ---
 
-## Table of Contents
-
-* [What is Contextual?](#what-is-contextual)
-* [Why it matters](#why-it-matters)
-* [How it works](#how-it-works)
-* [Architecture (Phase 2 MVP)](#architecture-phase-2-mvp)
-* [Repository Layout](#repository-layout)
-* [Quick Start (Hello-Flow)](#quick-start-hello-flow)
-* [Configuration](#configuration)
-* [Run & Operate](#run--operate)
-* [Smoke Test](#smoke-test)
-* [Troubleshooting](#troubleshooting)
-* [Roadmap](#roadmap)
-* [Contributing](#contributing)
-* [License](#license)
+## What’s in the M1 (Phase 2 MVP)
+- **Git Webhook → MQ ingest**: `/ingest/git` verifies `X-Hub-Signature-256` and enqueues `git_commit_raw`.
+- **Jira data ingestion**: projects/issues synced into Postgres (`jira_projects`, `jira_issues`, `jira_sync_state`).
+- **Semantic search (pgvector)**: Embeds Jira issues with an embedding model (LM Studio / Qwen3-Embedding-0.6B-GGUF).
+- **Top-K recommendation**: Build a query from commit message + files; return Top-K with cosine similarity.
+- **DingTalk ActionCard**: Top-1 + candidates in buttons; one-click confirm/choose.
+- **Feedback loop**:
+  - `interaction_log` records confirmation/correction.
+  - `notifications.clicked_at` tracks delivery/interaction.
+  - `commit_links` upserts the **final** mapping `commit → jira_key`.
+- **Noise suppression**: `RECO_MIN_SCORE` drops low-confidence candidates (no card sent).
 
 ---
 
-## What is Contextual?
+## Quickstart
 
-**Contextual** is an AI-powered bot that acts as your development team’s automated knowledge manager. It lives where your team collaborates—**DingTalk, Slack, Microsoft Teams**—and silently closes the gap between your **codebase** and your **project management** system.
+### 0) Prereqs
+- Docker / Docker Compose
+- DingTalk **custom bot** (webhook + optional keyword + secret)
+- Jira Cloud project & API token
+- LM Studio (for local embeddings) running at `http://localhost:1234` with model **Qwen3-Embedding-0.6B-GGUF** (dim **1024**)
 
-## Why it matters
+### 1) Configure `.env`
+Create a `.env` in project root (example values):
 
-In fast-moving teams, the crucial link between a code change and the business requirement it fulfills gets lost. This “context gap” causes:
+```ini
+# Git webhook
+GIT_WEBHOOK_SECRET=replace_me_github_secret
 
-* **Slow onboarding** — New engineers struggle to reconstruct the “why.”
-* **Painful maintenance** — Debugging devolves into ticket archaeology and pinging colleagues.
-* **Ineffective code reviews** — Reviewers lack the story behind changes.
+# DingTalk
+DINGTALK_WEBHOOK_URL=https://oapi.dingtalk.com/robot/send?access_token=XXXXX
+DINGTALK_SECRET=SECXXXXXXXXXXXX
+# If your bot requires a keyword, set it (optional)
+# DINGTALK_KEYWORD=[Contextual]
 
-## How it works
+# Public callback base (trycloudflare quick tunnel)
+PUBLIC_BASE_URL=https://<your-subdomain>.trycloudflare.com
 
-1. **Analyze** — Watches your Git repo for new commits.
-2. **Understand** — Uses an LLM to embed the code `diff` + `commit message`.
-3. **Recommend** — Searches Jira and picks the **single most relevant** issue.
-4. **Interact** — Sends a light prompt in chat: *“Likely JIRA-123. Correct?”*
-5. **Link** — One click **[✅ Yes, link it]** creates a permanent, queryable link.
-   Contextual learns from feedback and becomes smarter over time.
+# Postgres
+POSTGRES_HOST=postgres
+POSTGRES_DB=contextual
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
 
----
+# Jira (for sync jobs)
+JIRA_BASE=https://your-domain.atlassian.net
+JIRA_EMAIL=you@example.com
+JIRA_TOKEN=your_api_token
+JIRA_PROJECT_KEY=SCRUM
 
-## Architecture (Phase 2 MVP)
+# Embedding (LM Studio)
+EMBED_API_BASE=http://host.docker.internal:1234/v1
+EMBED_MODEL=Qwen3-Embedding-0.6B-GGUF
+EMBED_DIM=1024
+EMBED_API_KEY=lm-studio
 
-Message-driven microservices; async and resilient.
-
-* **webhook** — FastAPI service (port **8001**)
-  Receives Git webhooks, validates `X-Hub-Signature-256`, publishes to MQ topic **`git_commit_raw`**.
-
-* **core** — FastAPI service (port **8000**)
-  Consumes events → (MVP stub) selects top-1 Jira key → sends DingTalk **ActionCard** → logs to `notifications`.
-  *Behavior note:* card text is auto-prefixed with `DINGTALK_KEYWORD` when configured to satisfy DingTalk’s keyword policy.
-
-* **callback** — FastAPI service (port **8003**)
-  Receives ActionCard button clicks → writes to `interaction_log`.
-
-* **Infra**
-
-  * **PostgreSQL** (+ `pgvector` for future semantic search)
-  * **RabbitMQ** (decoupling, backpressure)
-  * **Redis** (optional: caching/rate-limits)
-
-> Current MVP sends a fixed recommendation (`DEMO-1`) to validate the end-to-end loop.
-
----
-
-## Repository Layout
-
-```
-services/
-  core/       # main orchestration, sends DingTalk ActionCard
-  webhook/    # receives Git webhooks, validates, publishes to MQ
-  callback/   # receives DingTalk interactions, writes to DB
-infra/
-  migrations/ # SQL migrations (e.g., notifications, interaction_log)
-scripts/
-  smoke.sh    # one-click health+send+simulate test
-docs/
-  README.zh-CN.md  # Chinese docs
-  RUNBOOK.md       # Ops runbook (quick tunnel changes, self-checks)
-docker-compose.yml
-Makefile
-.env.example
+# Recommendation thresholds
+RECO_LOW_SCORE=0.60
+RECO_MIN_SCORE=0.70
 ```
 
----
-
-## Quick Start (Hello-Flow)
-
-Goal: **`git push` → DingTalk card → click ✅ → DB updated.**
-
-### Prerequisites
-
-* Docker Desktop (with Compose), Git, Python 3
-* DingTalk **Custom Bot**
-
-  * If using **加签**, keep the `DINGTALK_SECRET`.
-  * If using **Keyword**, set something like `contextual` (we auto-prefix messages).
-* Two quick tunnels (Cloudflare or ngrok):
-
-  * Tunnel to **localhost:8003** → becomes `PUBLIC_BASE_URL` (callback buttons)
-  * Tunnel to **localhost:8001** → GitHub Webhook **Payload URL**
-
-### 1) Configure environment
-
-```bash
-cp .env.example .env
-# Edit .env:
-# - DINGTALK_WEBHOOK_URL=...
-# - DINGTALK_SECRET=...                # if signing is enabled
-# - DINGTALK_KEYWORD=contextual        # must match your DingTalk bot keyword
-# - PUBLIC_BASE_URL=https://<tunnel-8003>
-# - GIT_WEBHOOK_SECRET=<your-hmac-secret>
-```
-
-### 2) Boot services
+### 2) Bring up the stack
 
 ```bash
 docker compose up -d
 ```
 
-### 3) Expose callback (8003) and set `PUBLIC_BASE_URL`
+### 3) Expose callback publicly (quick tunnel)
 
 ```bash
 cloudflared tunnel --url http://localhost:8003
-# copy the https://<xxx>.trycloudflare.com
-make set-callback NEW=https://<xxx>.trycloudflare.com
+# copy the printed https://<random>.trycloudflare.com and update PUBLIC_BASE_URL in .env
+docker compose up -d --force-recreate core callback
 ```
 
-### 4) Configure GitHub Webhook
-
-In your repo: **Settings → Webhooks → Add webhook**
-
-* **Payload URL**: `https://<tunnel-for-8001>/ingest/git`
-* **Content type**: `application/json`
-* **Secret**: same as `GIT_WEBHOOK_SECRET` in `.env`
-* **Events**: `Just the push event` → Save
-
-### 5) One-command smoke test
+### 4) Run DB migrations
 
 ```bash
-make smoke
-# Expected: webhook+callback health OK; DingTalk receives a "smoke-check" text; a new ActionCard appears.
+docker compose cp infra/migrations/002_jira_meta.sql postgres:/tmp/002.sql
+docker compose exec -T postgres psql -U postgres -d contextual -f /tmp/002.sql
+
+docker compose cp infra/migrations/003_jira_embedding.sql postgres:/tmp/003.sql
+docker compose exec -T postgres psql -U postgres -d contextual -f /tmp/003.sql
+
+docker compose cp infra/migrations/005_commit_link.sql postgres:/tmp/005.sql
+docker compose exec -T postgres psql -U postgres -d contextual -f /tmp/005.sql
 ```
 
-### 6) Verify the loop
-
-* Click **✅** on the card.
-* Inspect DB:
+### 5) Sync Jira & build embeddings
 
 ```bash
-make db-last
-# Expected: notifications.clicked_at has a timestamp; interaction_log has a new row.
+# Incremental sync (since last run)
+docker compose exec -T core python /app/jobs/jira_sync.py --project ${JIRA_PROJECT_KEY:-SCRUM}
+
+# Embed issues for search
+docker compose exec -T core python /app/jobs/embed_jira.py --project ${JIRA_PROJECT_KEY:-SCRUM} --limit 500
 ```
 
----
-
-## Configuration
-
-| Key                    | Example                                                 | Notes                                                                                          |
-| ---------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `GIT_WEBHOOK_SECRET`   | `changeme-github-secret`                                | HMAC secret for `X-Hub-Signature-256`. Must match GitHub Webhook.                              |
-| `DINGTALK_WEBHOOK_URL` | `https://oapi.dingtalk.com/robot/send?access_token=...` | DingTalk custom bot URL.                                                                       |
-| `DINGTALK_SECRET`      | `SEC...`                                                | DingTalk signing secret (if **加签** enabled).                                                   |
-| `DINGTALK_KEYWORD`     | `contextual`                                            | If your bot enforces **Keyword**, this word must be included. We auto-prefix messages with it. |
-| `PUBLIC_BASE_URL`      | `https://xxx.trycloudflare.com`                         | Public base URL for **callback** (8003). Buttons use this.                                     |
-| `RELAY_URL` (optional) | `http://host.docker.internal:9000/send`                 | If direct access to DingTalk is blocked, point core to your relay.                             |
-| `POSTGRES_*`           | `postgres/contextual`                                   | DB connection (Compose defaults).                                                              |
-| `RABBITMQ_*`           | `guest/guest`                                           | MQ creds (Compose defaults).                                                                   |
-
-> `.env` is ignored by git. Use `.env.example` as your safe template.
-
----
-
-## Run & Operate
-
-Common tasks via **Makefile**:
+### 6) Smoke test
 
 ```bash
-make up            # start all services
-make down          # stop all services
-make logs-core     # tail core logs
-make logs-webhook  # tail webhook logs
-make logs-callback # tail callback logs
-make restart-core  # recreate core to reload env
-make rebuild-core  # rebuild core image and start
-make set-callback NEW=https://X.trycloudflare.com   # update PUBLIC_BASE_URL and restart core
-make mq            # RabbitMQ queues
-make db-last       # recent notifications & interaction logs
+# health checks + DingTalk ping + sample push
+bash scripts/smoke.sh
 ```
 
-More ops notes in **docs/RUNBOOK.md** (quick tunnel swaps, self-checks, common errors).
-
----
-
-## Smoke Test
-
-We ship `scripts/smoke.sh` for a full-path self-check:
-
-1. Health check: `/health` on **webhook** and **callback**
-2. Send DingTalk **text** (keyword-aware)
-3. Simulate a Git `push` to `/ingest/git`
-
-Run:
+### 7) Send a test push (ActionCard expected)
 
 ```bash
-./scripts/smoke.sh
+PAYLOAD='{
+  "repository":{"full_name":"demo/contextual"},
+  "commits":[{"id":"hello-1234567890","message":"what done + backlog test","added":["a.py"],"modified":["b.md"]}]
+}'
+SIG='sha256='$(printf "%s" "$PAYLOAD" | openssl dgst -sha256 -hmac "$GIT_WEBHOOK_SECRET" -binary | xxd -p -c 256)
+curl -i -X POST http://localhost:8001/ingest/git \
+  -H "Content-Type: application/json" -H "X-Hub-Signature-256: $SIG" \
+  --data-binary "$PAYLOAD"
 ```
 
----
+You should see:
 
-## Troubleshooting
-
-* **No card in DingTalk, but `delivered_at` exists**
-  Your bot likely enforces **Keyword**. Ensure `.env` has `DINGTALK_KEYWORD` that matches bot settings.
-  The core service auto-prefixes the keyword; DingTalk should return `{"errcode":0}`.
-
-* **GitHub Webhook shows 404**
-  Payload URL must include path: **`/ingest/git`** (not `/`).
-
-* **Webhook returns 401**
-  Signature mismatch. `GIT_WEBHOOK_SECRET` must match GitHub’s Webhook Secret.
-
-* **Callback opens but DB not updated**
-  Old cards still point to the **old** `PUBLIC_BASE_URL`. After changing tunnels, update `.env`, run `make set-callback NEW=...`, then send a **new** card.
-
-* **RabbitMQ `unacked` grows**
-  Typically a DB write issue. Current core acks **after successful send**; DB failures log warnings and won’t block consumption.
-
-* **Containers can’t reach `oapi.dingtalk.com` (China mainland networks)**
-  Prefer direct access: clear proxy envs in the container, set `NO_PROXY=.dingtalk.com`, use domestic DNS in Compose.
-  As a fallback, set up a local/edge **relay** and configure `RELAY_URL`.
+* Core logs: `[RECO] …` then `[DINGTALK RESP] 200 …`
+* A DingTalk ActionCard with **Top-1** and candidate buttons
+* After clicking, DB rows in `notifications`, `interaction_log`, and **final link** in `commit_links`
 
 ---
 
-## Roadmap
+## Data Model (MVP)
 
-* 🔍 Replace MVP stub with real **embedding + vector search** against Jira (`pgvector` now; optional Weaviate/Milvus later).
-* 🧠 Online learning from `interaction_log` to improve ranking.
-* 🧩 Slack/Teams parity with the DingTalk flow.
-* 📊 Basic dashboard: deliveries, clicks, latency, failure rates.
-* 🔐 Secret management (Vault/K8s Secrets) & per-tenant configs.
-
----
-
-## Contributing
-
-PRs welcome! Please:
-
-* Keep changes small and observable (add meaningful logs).
-* Update **docs/RUNBOOK.md** and **README** when user flows change.
-* Don’t commit secrets; `.env` is ignored.
+* `jira_projects(project_key, name, raw, updated_at)`
+* `jira_issues(jira_key, project_key, title, description, status, priority, assignee, reporter, url, created_at, updated_at, raw, embedding vector(1024))`
+* `jira_sync_state(project_key, last_issue_updated, last_run)`
+* `notifications(trace_id, tenant_id, commit_hash, recommended_jira_key, confidence, delivered_at, clicked_at)`
+* `interaction_log(commit_hash, recommended_jira_key, user_feedback, corrected_jira_key, interaction_timestamp)`
+* `commit_links(commit_hash PK, jira_key, project_key, confidence, trace_id, linked_at)`
 
 ---
 
-## License
+## Ops & Tuning
 
-MIT © wssab314
+* **Thresholds**
+
+  * `RECO_MIN_SCORE` — drop low confidence (no card).
+  * `RECO_LOW_SCORE` — show a warning title.
+* **Rotate PUBLIC_BASE_URL** if quick-tunnel expires; then `docker compose up -d --force-recreate core callback`.
+* **Keyword-gated DingTalk bots**: ensure `DINGTALK_KEYWORD` is prefixed in card body (already handled).
 
 ---
 
-*Also available in Chinese: [docs/README.zh-CN.md](docs/README.zh-CN.md)*
+## Dev Scripts
+
+* `scripts/smoke.sh` — webhook/callback health + DingTalk ping + sample push
+* Jobs:
+
+  * `/app/jobs/jira_sync.py`
+  * `/app/jobs/embed_jira.py`
+  * `/app/jobs/reco_search.py`
+
+---
+
+## Roadmap (next)
+
+* Real-time GitHub/GitLab app integration
+* Slack/Teams channels
+* Online learning from feedback
+* Multi-tenant isolation & RBAC
